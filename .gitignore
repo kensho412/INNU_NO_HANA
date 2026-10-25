@@ -1,0 +1,5 @@
+env_isaacsim/
+__pycache__/
+*.log
+# Blender が上書き保存のたびに作るバックアップ
+*.blend1

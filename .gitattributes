@@ -1,0 +1,5 @@
+# 改行コードの変換をかけないファイル (ポリシーの重み、Blender、USD)
+*.pt binary
+*.blend binary
+*.usdc binary
+*.usd binary
