@@ -93,10 +93,42 @@ def _cast_down_kernel(mesh: wp.uint64, starts: wp.array(dtype=wp.vec3), hit_z: w
         hit_z[i] = -1.0e6
 
 
+@wp.kernel
+def _cast_down_boxes_kernel(starts: wp.array(dtype=wp.vec3), positions: wp.array2d(dtype=float),
+                            orientations: wp.array2d(dtype=float), half_extents: wp.array(dtype=wp.vec3),
+                            hit_z: wp.array(dtype=float)):
+    """動く直方体 (blocks.py のブロック) にも光線を当て、地形より高く当たればそちらを採る。"""
+    i = wp.tid()
+    start = starts[i]
+    best = hit_z[i]
+    for b in range(half_extents.shape[0]):
+        center = wp.vec3(positions[b, 0], positions[b, 1], positions[b, 2])
+        rot = wp.quat(orientations[b, 1], orientations[b, 2], orientations[b, 3], orientations[b, 0])  # wxyz → xyzw
+        o = wp.quat_rotate_inv(rot, start - center)  # 箱の座標系での出発点と向き
+        d = wp.quat_rotate_inv(rot, wp.vec3(0.0, 0.0, -1.0))
+        h = half_extents[b]
+        t_in = float(-1.0e6)
+        t_out = float(1.0e6)
+        inside_slabs = True
+        for k in range(3):
+            if wp.abs(d[k]) < 1.0e-8:
+                if wp.abs(o[k]) > h[k]:
+                    inside_slabs = False
+            else:
+                ta = (-h[k] - o[k]) / d[k]
+                tb = (h[k] - o[k]) / d[k]
+                t_in = wp.max(t_in, wp.min(ta, tb))
+                t_out = wp.min(t_out, wp.max(ta, tb))
+        if inside_slabs and t_out >= t_in and t_out >= 0.0:
+            best = wp.max(best, start[2] - wp.max(t_in, 0.0))  # 出発点が箱の中なら出発点の高さ
+    hit_z[i] = best
+
+
 class TerrainRaycaster:
     """ステージの衝突物 (Mesh / Cube) と z=0 の地面を 1 つのメッシュにして、真下への光線を当てる。
 
     地形を置き直したら rebuild() を呼ぶ。Sphere や Cylinder など他の形状は高さ計測に映らない。
+    動く物 (blocks.py のブロック) は set_boxes() で渡すと、毎回その時点の位置で光線を当てる。
     """
 
     def __init__(self, root_paths: tuple[str, ...] = ("/World/Terrain",), ground_z: float | None = 0.0,
@@ -104,7 +136,19 @@ class TerrainRaycaster:
         self._root_paths = root_paths
         self._ground_z = ground_z
         self._device = device
+        self._boxes = None
         self.rebuild()
+
+    def set_boxes(self, boxes: object) -> None:
+        """boxes() が (位置 (N, 3), 向き wxyz (N, 4), 辺の半分 (N,) vec3) の Warp 配列か None を返す物。"""
+        self._boxes = boxes
+        z = wp.zeros(1, dtype=float, device=self._device)  # カーネルのコンパイルを物理コールバックの外で済ませる
+        empty2d = wp.zeros((0, 3), dtype=float, device=self._device)
+        wp.launch(_cast_down_boxes_kernel, dim=1, device=self._device,
+                  inputs=[wp.zeros(1, dtype=wp.vec3, device=self._device), empty2d,
+                          wp.zeros((0, 4), dtype=float, device=self._device),
+                          wp.zeros(0, dtype=wp.vec3, device=self._device), z])
+        z.numpy()
 
     def rebuild(self) -> None:
         stage = get_current_stage()
@@ -153,13 +197,16 @@ class TerrainRaycaster:
         self._points = wp.array(np.vstack(vertices).astype(np.float32), dtype=wp.vec3, device=self._device)
         self._indices = wp.array(np.vstack(triangles).astype(np.int32).ravel(), dtype=wp.int32, device=self._device)
         self._mesh = wp.Mesh(points=self._points, indices=self._indices)
-        self.cast_down(np.zeros((1, 3)))  # カーネルのコンパイルを物理コールバックの外で済ませる
+        self.cast_down(np.zeros((1, 3)), with_boxes=False)  # カーネルのコンパイルを物理コールバックの外で済ませる
 
-    def cast_down(self, starts: np.ndarray) -> np.ndarray:
+    def cast_down(self, starts: np.ndarray, with_boxes: bool = True) -> np.ndarray:
         """starts (N, 3) から真下に光線を飛ばし、当たった点の z を返す (当たらなければ -1e6)。"""
         starts_wp = wp.array(starts.astype(np.float32), dtype=wp.vec3, device=self._device)
         hit_z = wp.empty(len(starts), dtype=float, device=self._device)
         wp.launch(_cast_down_kernel, dim=len(starts), inputs=[self._mesh.id, starts_wp, hit_z], device=self._device)
+        boxes = self._boxes() if with_boxes and self._boxes is not None else None
+        if boxes is not None:
+            wp.launch(_cast_down_boxes_kernel, dim=len(starts), inputs=[starts_wp, *boxes, hit_z], device=self._device)
         return hit_z.numpy()
 
 

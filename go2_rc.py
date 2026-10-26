@@ -15,8 +15,13 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
     R               初期位置に戻す (転んだときも)
     T               障害物を動かした・足したあとに、高さ計測用の地形を作り直す
     C               Go2 の後ろを追従するカメラ / 自由に動かせる通常のカメラ を切り替える (起動時は追従)
+    B               10×10×20 cm のブロックを Go2 の前に寝かせて置く (進む向きに対して横向き)
+    G               10×10×20 cm のブロックを Go2 の前に立てて置く
+    V               10 cm 角のブロックを Go2 の前に置く
+    X               置いたブロックをすべて片付ける
 
 障害物は /World/Terrain の下に、衝突判定 (Collision) 付きで置く (terrain.py を参照)。
+キーで置くブロックは物理演算つきで、蹴ると動き、積むこともできる (blocks.py を参照)。
 
 起動:
     run_go2.bat をダブルクリック、または
@@ -47,6 +52,8 @@ parser.add_argument("--usd", default=None, help="会場モデルなどの USD �
 parser.add_argument("--spawn-yaw", type=float, default=0.0,
                     help="Go2 の初期の向き [度] (+x から反時計回り。bundled では無視)")
 parser.add_argument("--print-force", action="store_true", help="送信値を 0.5 秒ごとに表示する")
+parser.add_argument("--physics-device", choices=["cpu", "cuda"], default="cpu",
+                    help="物理計算の場所。ロボット 1 台とブロック程度なら CPU のほうが速い")
 parser.add_argument("--no-chase-camera", action="store_true", help="起動時は追従カメラを使わない (C キーで切り替え可)")
 args, _ = parser.parse_known_args()
 
@@ -74,6 +81,7 @@ from isaacsim.storage.native import get_assets_root_path
 from omni.kit.viewport.utility import get_active_viewport
 from pxr import Gf, UsdGeom
 
+import blocks
 import terrain
 from go2_policy import IsaacLabGo2Controller, TerrainRaycaster, configure_robot, reset_robot
 
@@ -107,6 +115,12 @@ KEY_COMMANDS = {
     "N": [0, 0, YAW], "Q": [0, 0, YAW], "NUMPAD_7": [0, 0, YAW],
     "M": [0, 0, -YAW], "E": [0, 0, -YAW], "NUMPAD_9": [0, 0, -YAW],
 }
+
+# ブロック: キー → (種類, 立てるか)。Go2 の胴体の BLOCK_AHEAD 前の、地面 (や他のブロック) の
+# BLOCK_DROP_HEIGHT 上から落とす
+BLOCK_KEYS = {"B": ("long", False), "G": ("long", True), "V": ("cube", False)}
+BLOCK_AHEAD = 0.7  # m
+BLOCK_DROP_HEIGHT = 0.05  # m
 
 
 # ---------------------------------------------------------------------------------------------
@@ -151,7 +165,9 @@ if args.usd:
     n_collision = terrain.add_usd(os.path.abspath(args.usd))
     print(f"go2_rc: loaded {args.usd} ({n_collision} meshes given collision)" if n_collision
           else f"go2_rc: loaded {args.usd} (using the file's own collision settings)")
-SimulationManager.set_physics_sim_device("cuda")
+# GPU の物理計算は、動く剛体 (ブロック) があると 1 ステップごとの読み書きが重くなり実時間の 0.6 倍程度に
+# 落ちる。ロボット 1 台の小さなシーンでは CPU のほうが速い (2026-10-25 測定: CPU 約 1.0 倍)
+SimulationManager.set_physics_sim_device(args.physics_device)
 
 # Go2 の読み込みは付属のランナーに任せる (bundled のときは歩行もランナー)
 go2 = RobotPolicyRunner(get_go2_spec(), prim_path="/World/Go2", position=list(SPAWN_POSITION))
@@ -166,6 +182,14 @@ if args.policy != "bundled":
     raycaster = TerrainRaycaster() if args.policy == "rough" else None
     controller = IsaacLabGo2Controller(go2.articulation, actor_path, raycaster)
 
+# 物理演算つきのブロック (再生前に作っておく)。高さ計測にも映す
+block_pool = blocks.BlockPool()
+if controller is not None and controller.raycaster is not None:
+    block_raycaster = controller.raycaster
+else:  # 平地用ポリシーでも、ブロックを床や他のブロックの上に置くために地面の高さは測る
+    block_raycaster = TerrainRaycaster()
+block_raycaster.set_boxes(block_pool.boxes)
+
 foot_sensors = [
     ContactSensor(Contact.create(f"/World/Go2/{leg}_foot/contact_sensor", min_threshold=0, max_threshold=1e7, radius=-1))
     for leg in LEGS
@@ -179,6 +203,7 @@ base_command = np.zeros(3, dtype=np.float32)
 reset_requested = False
 terrain_rebuild_requested = False
 camera_toggle_requested = False
+block_requests: list[tuple[str, bool] | None] = []  # None = すべて片付ける
 
 
 def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
@@ -191,6 +216,10 @@ def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
             terrain_rebuild_requested = True
         elif name == "C":
             camera_toggle_requested = True
+        elif name in BLOCK_KEYS:
+            block_requests.append(BLOCK_KEYS[name])
+        elif name == "X":
+            block_requests.append(None)
     increment = KEY_COMMANDS.get(name)
     if increment is not None:
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -261,12 +290,38 @@ last_sent = np.zeros(4, dtype=np.int32)
 physics_steps = 0
 
 
+def handle_block_requests() -> None:
+    """物理コールバックの中で呼ぶ: キーで頼まれたブロックを置く・片付ける。"""
+    while block_requests:
+        request = block_requests.pop(0)
+        if request is None:
+            block_pool.clear()
+            continue
+        kind, upright = request
+        if controller is not None and controller.last_base_pose is not None:
+            base_pos, (w, x, y, z) = controller.last_base_pose
+        else:
+            positions, orientations = go2.articulation.get_world_poses()
+            base_pos, (w, x, y, z) = positions.numpy().reshape(-1), orientations.numpy().reshape(-1)
+        heading = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        xy = base_pos[:2] + BLOCK_AHEAD * np.array([np.cos(heading), np.sin(heading)])
+        ground_z = block_raycaster.cast_down(np.array([[xy[0], xy[1], base_pos[2] + 0.5]]))[0]
+        size = block_pool.size(kind)
+        height = size[0] if upright else size[2]
+        position = np.array([xy[0], xy[1], max(ground_z, -1.0) + height / 2 + BLOCK_DROP_HEIGHT])
+        # 寝かせるときは長辺を進む向きに対して横に、立てるときは面を Go2 に向ける
+        yaw = heading if upright or kind == "cube" else heading + np.pi / 2
+        block_pool.spawn(kind, position, yaw, upright)
+
+
 def on_physics_step(step_size: float, context: object) -> None:
     global first_step, reset_requested, policy_failed, last_sent, physics_steps
     physics_steps += 1
     if policy_failed:
         return
     try:
+        if block_requests and not first_step:
+            handle_block_requests()
         if first_step or reset_requested:
             if controller is None:
                 go2.restart_from_default_state(base_command.tolist())
@@ -296,6 +351,7 @@ physics_callback_id = SimulationManager.register_callback(on_physics_step, Isaac
 
 print(f"go2_rc: policy '{args.policy}', sending /gait/force (FR FL RR RL) to {args.host}:{args.port}")
 print("go2_rc: arrows/WASD = move, N/M or Q/E = turn, R = reset, T = rebuild terrain scan, C = chase camera on/off")
+print("go2_rc: B / G = 10x10x20 cm block lying / standing, V = 10 cm cube, X = clear blocks")
 
 timeline = omni.timeline.get_timeline_interface()
 timeline.play()
