@@ -24,6 +24,13 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
 障害物は /World/Terrain の下に、衝突判定 (Collision) 付きで置く (terrain.py を参照)。
 キーで置くブロックは物理演算つきで、蹴ると動き、積むこともできる (blocks.py を参照)。
 
+8×8 の足場 (--grid、grid.py を参照):
+    Max → シミュレータ  /grid/height  64 個の数 (整数でも小数でも)。マスごとの高さ [cm]、受け取ったときに一括で反映
+                        送り先はこの PC の --listen-port (既定 9872)
+    シミュレータ → Max  /grid/step  i × 64。マスごとに今踏まれていれば 1。/gait/force と同じ送信先へ 50 Hz で送る
+    シミュレータ → Max  /grid/foot  i × 4 (FR FL RR RL)。足ごとに着いているマスの番号、浮いている・足場の外なら -1
+    並び順は row × 8 + col (row 0 が Go2 の初期位置に近い列、col 0 が Go2 から見て左端)
+
 起動:
     run_go2.bat をダブルクリック、または
     .\\env_isaacsim\\Scripts\\activate
@@ -53,6 +60,12 @@ parser.add_argument("--usd", default=None, help="会場モデルなどの USD �
 parser.add_argument("--spawn-yaw", type=float, default=0.0,
                     help="Go2 の初期の向き [度] (+x から反時計回り。bundled では無視)")
 parser.add_argument("--print-force", action="store_true", help="送信値を 0.5 秒ごとに表示する")
+parser.add_argument("--grid", action="store_true", help="8×8 の足場を置く (高さは Max から /grid/height で変える)")
+parser.add_argument("--grid-center", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                    help="足場の中心 [m]。省略すると Go2 の初期位置の --grid-ahead 先から始まるように置く")
+parser.add_argument("--grid-ahead", type=float, default=1.0,
+                    help="Go2 の初期位置から足場の手前の端までの距離 [m] (--grid-center を省略したとき)")
+parser.add_argument("--listen-port", type=int, default=9872, help="Max から /grid/height を受け取るポート")
 parser.add_argument("--physics-device", choices=["cpu", "cuda"], default="cpu",
                     help="物理計算の場所。ロボット 1 台とブロック程度なら CPU のほうが速い")
 parser.add_argument("--no-chase-camera", action="store_true", help="起動時は追従カメラを使わない (C キーで切り替え可)")
@@ -73,6 +86,7 @@ import numpy as np
 import omni.appwindow
 import omni.timeline
 from isaacsim.core.experimental.utils.stage import define_prim, get_current_stage, set_stage_units, set_stage_up_axis
+from isaacsim.core.experimental.prims import RigidPrim
 from isaacsim.core.rendering_manager import RenderingManager
 from isaacsim.core.simulation_manager import SimulationManager
 from isaacsim.core.simulation_manager.impl.isaac_events import IsaacEvents
@@ -83,6 +97,7 @@ from omni.kit.viewport.utility import get_active_viewport
 from pxr import Gf, UsdGeom
 
 import blocks
+import grid
 import terrain
 from go2_policy import IsaacLabGo2Controller, TerrainRaycaster, configure_robot, reset_robot
 
@@ -128,7 +143,7 @@ PYRAMID_AHEAD = 0.8  # Go2 の胴体からピラミッドの中心まで [m]
 
 
 # ---------------------------------------------------------------------------------------------
-# OSC (python-osc を使わず、/gait/force iiii だけを組み立てる)
+# OSC (python-osc を使わず、必要な分だけを自前で組み立て・読み取る)
 # ---------------------------------------------------------------------------------------------
 
 
@@ -147,6 +162,46 @@ def send_gait_force(values: np.ndarray) -> None:
         osc_socket.sendto(OSC_PREFIX + struct.pack(">4i", *values), osc_target)
     except OSError as error:  # 送信先が無くてもシミュレーションは止めない
         carb.log_warn(f"OSC send failed: {error}")
+
+
+def send_osc_ints(address: str, values: np.ndarray) -> None:
+    packet = _osc_string(address) + _osc_string("," + "i" * len(values)) + struct.pack(f">{len(values)}i", *values)
+    try:
+        osc_socket.sendto(packet, osc_target)
+    except OSError as error:
+        carb.log_warn(f"OSC send failed: {error}")
+
+
+def _read_osc_string(data: bytes, offset: int) -> tuple[str, int]:
+    end = data.index(b"\0", offset)
+    return data[offset:end].decode("ascii", "replace"), end + 1 + (-(end + 1 - offset) % 4)
+
+
+def parse_osc(data: bytes) -> list[tuple[str, list[float]]]:
+    """OSC のメッセージ (またはバンドル) を [(アドレス, 数の引数), ...] にする。数以外の引数は飛ばす。"""
+    if data.startswith(b"#bundle\0"):
+        messages, offset = [], 16  # "#bundle\0" + タイムタグ 8 バイト
+        while offset + 4 <= len(data):
+            (size,) = struct.unpack_from(">i", data, offset)
+            messages += parse_osc(data[offset + 4:offset + 4 + size])
+            offset += 4 + size
+        return messages
+    address, offset = _read_osc_string(data, 0)
+    tags, offset = _read_osc_string(data, offset) if offset < len(data) else (",", offset)
+    values: list[float] = []
+    for tag in tags[1:]:
+        if tag in "if":
+            values.append(struct.unpack_from(">i" if tag == "i" else ">f", data, offset)[0])
+            offset += 4
+        elif tag in "hd":
+            values.append(struct.unpack_from(">q" if tag == "h" else ">d", data, offset)[0])
+            offset += 8
+        elif tag == "s":
+            offset = _read_osc_string(data, offset)[1]
+        elif tag == "b":
+            (size,) = struct.unpack_from(">i", data, offset)
+            offset += 4 + size + (-size % 4)
+    return [(address, values)]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -173,6 +228,26 @@ if args.usd:
 # 落ちる。ロボット 1 台の小さなシーンでは CPU のほうが速い (2026-10-25 測定: CPU 約 1.0 倍)
 SimulationManager.set_physics_sim_device(args.physics_device)
 
+# 8×8 の足場 (高さ計測用の地形メッシュを作る前に置く。囲いは地形として、柱は動く箱として測る)
+stepping_grid = None
+terrain_roots = (terrain.TERRAIN_ROOT,)
+if args.grid:
+    grid_yaw = np.radians(args.spawn_yaw if args.policy != "bundled" else 0.0)
+    if args.grid_center is not None:
+        grid_center = np.array(args.grid_center)
+    else:
+        grid_center = np.array(SPAWN_POSITION[:2]) + (args.grid_ahead + grid.GRID_N * grid.GRID_CELL / 2) * np.array(
+            [np.cos(grid_yaw), np.sin(grid_yaw)])
+    # 足場を置く床の高さを測る (建物の中なら床の上面)。屋根に当てないよう、床から 1 m ほどの高さから下へ
+    floor_raycaster = TerrainRaycaster(terrain_roots)
+    probe = grid.SteppingGrid.cell_centers(grid_center, grid_yaw)
+    floor_z = float(floor_raycaster.cast_down(np.column_stack([probe, np.full(len(probe), 1.0)])).max())
+    del floor_raycaster
+    stepping_grid = grid.SteppingGrid(tuple(grid_center), grid_yaw, base_z=floor_z)
+    terrain_roots += (grid.FENCE_ROOT,)
+    print(f"go2_rc: 8x8 grid at ({grid_center[0]:.2f}, {grid_center[1]:.2f}, floor {floor_z:.2f}), "
+          f"listening for /grid/height on UDP {args.listen_port}")
+
 # Go2 の読み込みは付属のランナーに任せる (bundled のときは歩行もランナー)
 go2 = RobotPolicyRunner(get_go2_spec(), prim_path="/World/Go2", position=list(SPAWN_POSITION))
 go2.spawn()
@@ -183,7 +258,7 @@ controller = None
 if args.policy != "bundled":
     configure_robot(go2.articulation, SPAWN_POSITION, args.spawn_yaw)
     actor_path = os.path.join(PROJECT_DIR, "policies", f"go2_{args.policy}_actor.pt")
-    raycaster = TerrainRaycaster() if args.policy == "rough" else None
+    raycaster = TerrainRaycaster(terrain_roots) if args.policy == "rough" else None
     controller = IsaacLabGo2Controller(go2.articulation, actor_path, raycaster)
 
 # 物理演算つきのブロック (再生前に作っておく)。高さ計測にも映す
@@ -191,13 +266,19 @@ block_pool = blocks.BlockPool()
 if controller is not None and controller.raycaster is not None:
     block_raycaster = controller.raycaster
 else:  # 平地用ポリシーでも、ブロックを床や他のブロックの上に置くために地面の高さは測る
-    block_raycaster = TerrainRaycaster()
-block_raycaster.set_boxes(block_pool.boxes)
+    block_raycaster = TerrainRaycaster(terrain_roots)
+block_raycaster.add_boxes(block_pool.boxes)
+if stepping_grid is not None:
+    block_raycaster.add_boxes(stepping_grid.boxes)
 
 foot_sensors = [
     ContactSensor(Contact.create(f"/World/Go2/{leg}_foot/contact_sensor", min_threshold=0, max_threshold=1e7, radius=-1))
     for leg in LEGS
 ]
+# 足場のどのマスを踏んでいるかを調べるための、足先の位置
+foot_links = RigidPrim([f"/World/Go2/{leg}_foot" for leg in LEGS]) if stepping_grid is not None else None
+GRID_SEND_EVERY = 4  # /grid/step と /grid/foot は物理 4 ステップごと (50 Hz) に送る
+last_grid_step = np.zeros(grid.GRID_N * grid.GRID_N, dtype=np.int32)
 
 # ---------------------------------------------------------------------------------------------
 # キーボード
@@ -343,13 +424,15 @@ def spawn_pyramid(base_pos: np.ndarray, heading: float) -> None:
 
 
 def on_physics_step(step_size: float, context: object) -> None:
-    global first_step, reset_requested, policy_failed, last_sent, physics_steps
+    global first_step, reset_requested, policy_failed, last_sent, physics_steps, last_grid_step
     physics_steps += 1
     if policy_failed:
         return
     try:
         if block_requests and not first_step:
             handle_block_requests()
+        if stepping_grid is not None and stepping_grid.apply_pending_heights():
+            print(f"go2_rc: grid heights set (cm) {np.round(stepping_grid.heights * 100).astype(int).tolist()}", flush=True)
         if first_step or reset_requested:
             if controller is None:
                 go2.restart_from_default_state(base_command.tolist())
@@ -369,6 +452,12 @@ def on_physics_step(step_size: float, context: object) -> None:
     force_n = np.array([s.get_sensor_reading().value for s in foot_sensors])
     last_sent = np.rint(np.maximum(force_n, 0.0) * FORCE_GAIN).astype(np.int32)
     send_gait_force(last_sent)
+    if stepping_grid is not None and physics_steps % GRID_SEND_EVERY == 0:
+        positions, _ = foot_links.get_world_poses()
+        foot_cells = stepping_grid.foot_cells(positions.numpy()[:, :2], force_n)
+        last_grid_step = stepping_grid.stepped(foot_cells)
+        send_osc_ints("/grid/step", last_grid_step)
+        send_osc_ints("/grid/foot", foot_cells)
 
 
 physics_callback_id = SimulationManager.register_callback(on_physics_step, IsaacEvents.POST_PHYSICS_STEP)
@@ -381,6 +470,34 @@ print(f"go2_rc: policy '{args.policy}', sending /gait/force (FR FL RR RL) to {ar
 print("go2_rc: arrows/WASD = move, N/M or Q/E = turn, R = reset, T = rebuild terrain scan, C = chase camera on/off")
 print("go2_rc: B / G = 10x10x20 cm block lying / standing, V = 10 cm cube, P = cube pyramid, X = clear blocks")
 
+# Max からの /grid/height (メインループで受け取り、次の物理ステップで反映する)
+listen_socket = None
+if stepping_grid is not None:
+    listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listen_socket.bind(("0.0.0.0", args.listen_port))
+    listen_socket.setblocking(False)
+
+
+def poll_osc_input() -> None:
+    while True:
+        try:
+            data = listen_socket.recv(65536)
+        except (BlockingIOError, ConnectionResetError):
+            return
+        try:
+            messages = parse_osc(data)
+        except (ValueError, struct.error, IndexError) as error:
+            carb.log_warn(f"go2_rc: could not read an OSC packet: {error}")
+            continue
+        for address, values in messages:
+            if address != "/grid/height":
+                continue
+            if len(values) != grid.GRID_N * grid.GRID_N:
+                carb.log_warn(f"go2_rc: /grid/height needs {grid.GRID_N * grid.GRID_N} values, got {len(values)}")
+                continue
+            stepping_grid.request_heights(np.array(values, dtype=np.float64) / 100.0)  # cm → m
+
+
 timeline = omni.timeline.get_timeline_interface()
 timeline.play()
 simulation_app.update()
@@ -391,6 +508,10 @@ while simulation_app.is_running():
     simulation_app.update()
     if not SimulationManager.is_simulating():
         first_step = True  # 停止 → 再生したら初期化からやり直す
+    if listen_socket is not None:
+        poll_osc_input()
+    if stepping_grid is not None:
+        stepping_grid.show_stepped(last_grid_step)
     if camera_toggle_requested:
         camera_toggle_requested = False
         chase_camera.set_enabled(not chase_camera.enabled)
@@ -425,4 +546,6 @@ input_interface.unsubscribe_to_keyboard_events(keyboard, keyboard_sub)
 SimulationManager.deregister_callback(physics_callback_id)
 go2.close()
 osc_socket.close()
+if listen_socket is not None:
+    listen_socket.close()
 simulation_app.close()

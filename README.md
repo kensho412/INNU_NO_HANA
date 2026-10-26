@@ -8,6 +8,7 @@ Unitree Go2 を使ったサウンドアートのための、Isaac Sim 上の仮�
 - 4 本の足先の接触力を、実機と同じ形式の OSC `/gait/force` で Max (`innu.maxpat`) に送る
 - 階段・ブロック・凹凸や、象の鼻テラスの会場モデルの上を歩かせる
 - キーを押すと、物理演算つきの小さなブロック (10×10×20 cm / 10 cm 角) が Go2 の前に落ちてくる
+- 8×8 のマス目の足場を置き、マスごとの高さを Max から変え、どのマスが踏まれているかを Max に返す
 
 学習 (機械学習) はしません。NVIDIA が配布している学習済みの歩行ポリシーを動かすだけです。
 
@@ -88,12 +89,37 @@ Go2 は動いたあとの位置を見て踏み越えます。
   使い回します。5 段 (55 個) 以上にするときは `blocks.py` の `BLOCKS_PER_KIND["cube"]` も増やしてください
 - R (Go2 を初期位置に戻す) ではブロックは残ります
 
+### 8×8 の足場 (`--grid`)
+
+Go2 の初期位置の 1 m 先に、25 cm 角のマスが 8×8 (2 m 四方) 並んだ足場を置きます (`run_go2.bat` では最初から置く。
+置かないときは `set GRID=` にする)。象の鼻テラスでは、正面入口から 1.5 m 入った広間の床の上に置きます
+(`run_go2.bat` の `--grid-ahead 7.6`。Go2 はスロープを上って入口から入る)。マスはそれぞれ物理演算つきの柱で、踏むと少し揺れますが、外周の囲いと
+隣の柱に挟まれているので、基本的には蹴とばされません。
+
+| 向き | アドレス | 中身 |
+|---|---|---|
+| Max → シミュレータ | `/grid/height` | 64 個の数 (整数でも小数でも)。マスごとの高さ [cm]。受け取った瞬間に 64 マスまとめて変わる |
+| シミュレータ → Max | `/grid/step` | 64 個の整数。マスごとに、いま足が着いていれば 1、いなければ 0。50 Hz |
+| シミュレータ → Max | `/grid/foot` | 4 個の整数 (FR FL RR RL)。足ごとに着いているマスの番号 (0〜63)。浮いている・足場の外なら -1。50 Hz |
+
+- `/grid/height` はこの PC の UDP **9872** に送ります (Max なら `[prepend /grid/height]` → `[udpsend <この PC の IP> 9872]`)。
+  ポートは `--listen-port` で変えられます。Windows のファイアウォールの許可を求められたら許可してください
+- `/grid/step` と `/grid/foot` は `/gait/force` と同じ送信先 (`run_go2.bat` の `HOST` とポート) に送ります。`[route /gait/force /grid/step /grid/foot]` で分けられます
+- 64 個の並びは `row × 8 + col`。row 0 が Go2 の初期位置に近い列、col 0 が Go2 から見て左端です
+- 高さは 1〜30 cm に丸めます (0 は 1 cm)。試したところ、2 cm ずつ高くなる段は 14 cm まで上れ、25 cm の列は越えられませんでした
+- 64 個ちょうどでないメッセージは無視します
+- 踏まれているマスは光ります (`/grid/step` が 1 のマス。色と強さは `grid.py` の `GLOW_COLOR` / `GLOW_INTENSITY`)
+- 高さは足場を置いた床から測ります (建物の中なら床の上面。起動時に自動で測る)
+- 起動時はすべて 5 cm。Go2 が乗っているときに高さを変えると、Go2 は下から突き上げられます
+- マスの大きさ・囲いの高さ・柱の重さなどは `grid.py` の冒頭、置く位置は `--grid-ahead 距離` か `--grid-center X Y`
+
 ### 起動オプション (`go2_rc.py`)
 
 ```
 python go2_rc.py [--host 127.0.0.1] [--port 9871] [--policy rough|flat|bundled]
                  [--course demo|none] [--usd 会場.usd] [--spawn-yaw 度]
                  [--print-force] [--physics-device cpu|cuda] [--no-chase-camera]
+                 [--grid] [--grid-ahead 1.0] [--grid-center X Y] [--listen-port 9872]
 ```
 
 | オプション | 意味 |
@@ -106,6 +132,10 @@ python go2_rc.py [--host 127.0.0.1] [--port 9871] [--policy rough|flat|bundled]
 | `--print-force` | 送っている値と、実時間に対する速度を 0.5 秒ごとに表示する |
 | `--physics-device` | 物理計算を CPU (既定) と GPU (`cuda`) のどちらでするか。ロボット 1 台の小さなシーンでは CPU のほうが速い (GPU は動くブロックがあると実時間の約 0.6 倍に落ちる) |
 | `--no-chase-camera` | 起動時に追従カメラを使わない |
+| `--grid` | 8×8 の足場を置く |
+| `--grid-ahead` | Go2 の初期位置から足場の手前の端までの距離 [m] (既定 1.0) |
+| `--grid-center` | 足場の中心 [m]。省略すると Go2 の初期位置の `--grid-ahead` 先から始まる |
+| `--listen-port` | `/grid/height` を受け取るポート (既定 9872) |
 
 ## OSC `/gait/force`
 
@@ -154,6 +184,7 @@ Blender で作って USD (`.usd` / `.usdc`) に書き出し、`run_go2.bat` に�
 | `go2_policy.py` | Isaac Lab の Go2 歩行ポリシーを動かす部分 (観測の組み立て、足元の高さ計測、DC モータのモデル) |
 | `terrain.py` | 障害物と会場モデルの配置 |
 | `blocks.py` | キーで置く、物理演算つきのブロック |
+| `grid.py` | 8×8 の足場 (高さの変更と、踏まれているマスの判定) |
 | `tools/build_zounohana_terrace.py` | 象の鼻テラスを Blender で作るスクリプト |
 | `venues/` | 会場モデル (`.blend` は Blender で編集する元データ) |
 | `policies/` | 歩行ポリシーの重み |

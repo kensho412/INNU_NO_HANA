@@ -128,7 +128,7 @@ class TerrainRaycaster:
     """ステージの衝突物 (Mesh / Cube) と z=0 の地面を 1 つのメッシュにして、真下への光線を当てる。
 
     地形を置き直したら rebuild() を呼ぶ。Sphere や Cylinder など他の形状は高さ計測に映らない。
-    動く物 (blocks.py のブロック) は set_boxes() で渡すと、毎回その時点の位置で光線を当てる。
+    動く物 (blocks.py のブロック、grid.py の柱) は add_boxes() で渡すと、毎回その時点の位置で光線を当てる。
     """
 
     def __init__(self, root_paths: tuple[str, ...] = ("/World/Terrain",), ground_z: float | None = 0.0,
@@ -136,12 +136,12 @@ class TerrainRaycaster:
         self._root_paths = root_paths
         self._ground_z = ground_z
         self._device = device
-        self._boxes = None
+        self._box_sources: list = []
         self.rebuild()
 
-    def set_boxes(self, boxes: object) -> None:
+    def add_boxes(self, boxes: object) -> None:
         """boxes() が (位置 (N, 3), 向き wxyz (N, 4), 辺の半分 (N,) vec3) の Warp 配列か None を返す物。"""
-        self._boxes = boxes
+        self._box_sources.append(boxes)
         z = wp.zeros(1, dtype=float, device=self._device)  # カーネルのコンパイルを物理コールバックの外で済ませる
         empty2d = wp.zeros((0, 3), dtype=float, device=self._device)
         wp.launch(_cast_down_boxes_kernel, dim=1, device=self._device,
@@ -204,9 +204,10 @@ class TerrainRaycaster:
         starts_wp = wp.array(starts.astype(np.float32), dtype=wp.vec3, device=self._device)
         hit_z = wp.empty(len(starts), dtype=float, device=self._device)
         wp.launch(_cast_down_kernel, dim=len(starts), inputs=[self._mesh.id, starts_wp, hit_z], device=self._device)
-        boxes = self._boxes() if with_boxes and self._boxes is not None else None
-        if boxes is not None:
-            wp.launch(_cast_down_boxes_kernel, dim=len(starts), inputs=[starts_wp, *boxes, hit_z], device=self._device)
+        for source in self._box_sources if with_boxes else []:
+            boxes = source()
+            if boxes is not None:
+                wp.launch(_cast_down_boxes_kernel, dim=len(starts), inputs=[starts_wp, *boxes, hit_z], device=self._device)
         return hit_z.numpy()
 
 

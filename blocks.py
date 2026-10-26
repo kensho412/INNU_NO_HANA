@@ -5,7 +5,7 @@ GPU で物理計算しているときは、再生中に剛体を新しく作れ�
 用意した数を超えて出すと、その種類でいちばん古いブロックを持ってくる。
 
 ブロックは /World/Terrain の外 (/World/Blocks) に置く。動くので高さ計測用の地形メッシュには
-入れず、TerrainRaycaster.set_boxes() で毎回いまの位置を渡して光線を当てる。
+入れず、TerrainRaycaster.add_boxes() で毎回いまの位置を渡して光線を当てる。
 """
 
 from __future__ import annotations
