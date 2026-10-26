@@ -18,7 +18,7 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
     B               10×10×20 cm のブロックを Go2 の前に寝かせて置く (進む向きに対して横向き)
     G               10×10×20 cm のブロックを Go2 の前に立てて置く
     V               10 cm 角のブロックを Go2 の前に置く
-    P               10 cm 角のブロックを 3 段のピラミッド (3×3, 2×2, 1 の 14 個) に積んで Go2 の前に置く
+    P               10 cm 角のブロックを 4 段のピラミッド (4×4, 3×3, 2×2, 1 の 30 個) に積んで Go2 の前に置く
     X               置いたブロックをすべて片付ける
 
 障害物は /World/Terrain の下に、衝突判定 (Collision) 付きで置く (terrain.py を参照)。
@@ -123,7 +123,7 @@ BLOCK_KEYS = {"B": ("long", False), "G": ("long", True), "V": ("cube", False)}
 BLOCK_AHEAD = 0.7  # m
 BLOCK_DROP_HEIGHT = 0.05  # m
 # P: 10 cm 角のブロックのピラミッド。下から PYRAMID_LEVELS × PYRAMID_LEVELS, …, 1 個ずつ積む
-PYRAMID_LEVELS = 3  # 14 個 (blocks.BLOCKS_PER_KIND 以下にする)
+PYRAMID_LEVELS = 4  # 4×4, 3×3, 2×2, 1 の 30 個 (blocks.BLOCKS_PER_KIND["cube"] 以下にする)
 PYRAMID_AHEAD = 0.8  # Go2 の胴体からピラミッドの中心まで [m]
 
 

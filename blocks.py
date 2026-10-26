@@ -24,7 +24,7 @@ BLOCK_KINDS = {
     "long": ((0.2, 0.1, 0.1), (0.78, 0.62, 0.42)),  # 10 × 10 × 20 cm
     "cube": ((0.1, 0.1, 0.1), (0.82, 0.48, 0.34)),  # 10 × 10 × 10 cm
 }
-BLOCKS_PER_KIND = 20
+BLOCKS_PER_KIND = {"long": 20, "cube": 40}  # 種類ごとの数。10 cm 角はピラミッド (P) の 30 個 + 単品の分
 BLOCK_DENSITY = 600.0  # kg/m³ (木材くらい。10×10×20 cm で 1.2 kg、10 cm 角で 0.6 kg)
 PARK_ORIGIN = (-300.0, -300.0)  # 使っていないブロックを置いておく場所 (会場から離れた地面の上)
 
@@ -47,7 +47,7 @@ def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 class BlockPool:
     """再生前に作る。spawn() / clear() は物理コールバックの中で呼ぶ。"""
 
-    def __init__(self, per_kind: int = BLOCKS_PER_KIND, density: float = BLOCK_DENSITY,
+    def __init__(self, per_kind: dict[str, int] = BLOCKS_PER_KIND, density: float = BLOCK_DENSITY,
                  device: str = "cuda:0") -> None:
         stage = get_current_stage()
         UsdGeom.Xform.Define(stage, BLOCK_ROOT)
@@ -56,7 +56,7 @@ class BlockPool:
         paths, sizes, self._kind_indices = [], [], {}
         for kind, (size, color) in BLOCK_KINDS.items():
             self._kind_indices[kind] = []
-            for k in range(per_kind):
+            for k in range(per_kind[kind]):
                 index = len(paths)
                 path = f"{BLOCK_ROOT}/{kind}_{k:02d}"
                 cube = UsdGeom.Cube.Define(stage, path)
