@@ -9,7 +9,7 @@
             "modernui": 1
         },
         "classnamespace": "box",
-        "rect": [ 35.0, 85.0, 1210.0, 1272.0 ],
+        "rect": [ 3875.0, 85.0, 1210.0, 576.0 ],
         "boxes": [
             {
                 "box": {
@@ -17,8 +17,8 @@
                     "maxclass": "newobj",
                     "numinlets": 1,
                     "numoutlets": 0,
-                    "patching_rect": [ 30.0, 127.0, 158.0, 22.0 ],
-                    "text": "udpsend 192.168.50.2 9898"
+                    "patching_rect": [ 30.0, 127.0, 171.0, 22.0 ],
+                    "text": "udpsend 100.127.189.90 9898"
                 }
             },
             {
@@ -29,7 +29,7 @@
                     "numoutlets": 1,
                     "outlettype": [ "" ],
                     "patching_rect": [ 383.0, 127.0, 128.0, 22.0 ],
-                    "text": "16 28 37 16"
+                    "text": "21 28 52 0"
                 }
             },
             {
@@ -302,7 +302,6 @@
                         },
                         "classnamespace": "box",
                         "rect": [ 59.0, 120.0, 1000.0, 780.0 ],
-                        "visible": 1,
                         "boxes": [
                             {
                                 "box": {
