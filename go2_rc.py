@@ -18,6 +18,7 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
     B               10×10×20 cm のブロックを Go2 の前に寝かせて置く (進む向きに対して横向き)
     G               10×10×20 cm のブロックを Go2 の前に立てて置く
     V               10 cm 角のブロックを Go2 の前に置く
+    P               10 cm 角のブロックを 3 段のピラミッド (3×3, 2×2, 1 の 14 個) に積んで Go2 の前に置く
     X               置いたブロックをすべて片付ける
 
 障害物は /World/Terrain の下に、衝突判定 (Collision) 付きで置く (terrain.py を参照)。
@@ -121,6 +122,9 @@ KEY_COMMANDS = {
 BLOCK_KEYS = {"B": ("long", False), "G": ("long", True), "V": ("cube", False)}
 BLOCK_AHEAD = 0.7  # m
 BLOCK_DROP_HEIGHT = 0.05  # m
+# P: 10 cm 角のブロックのピラミッド。下から PYRAMID_LEVELS × PYRAMID_LEVELS, …, 1 個ずつ積む
+PYRAMID_LEVELS = 3  # 14 個 (blocks.BLOCKS_PER_KIND 以下にする)
+PYRAMID_AHEAD = 0.8  # Go2 の胴体からピラミッドの中心まで [m]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -203,7 +207,7 @@ base_command = np.zeros(3, dtype=np.float32)
 reset_requested = False
 terrain_rebuild_requested = False
 camera_toggle_requested = False
-block_requests: list[tuple[str, bool] | None] = []  # None = すべて片付ける
+block_requests: list[tuple[str, bool] | str | None] = []  # "pyramid" = ピラミッド、None = すべて片付ける
 
 
 def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
@@ -218,6 +222,8 @@ def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
             camera_toggle_requested = True
         elif name in BLOCK_KEYS:
             block_requests.append(BLOCK_KEYS[name])
+        elif name == "P":
+            block_requests.append("pyramid")
         elif name == "X":
             block_requests.append(None)
     increment = KEY_COMMANDS.get(name)
@@ -297,13 +303,16 @@ def handle_block_requests() -> None:
         if request is None:
             block_pool.clear()
             continue
-        kind, upright = request
         if controller is not None and controller.last_base_pose is not None:
             base_pos, (w, x, y, z) = controller.last_base_pose
         else:
             positions, orientations = go2.articulation.get_world_poses()
             base_pos, (w, x, y, z) = positions.numpy().reshape(-1), orientations.numpy().reshape(-1)
         heading = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        if request == "pyramid":
+            spawn_pyramid(base_pos, heading)
+            continue
+        kind, upright = request
         xy = base_pos[:2] + BLOCK_AHEAD * np.array([np.cos(heading), np.sin(heading)])
         ground_z = block_raycaster.cast_down(np.array([[xy[0], xy[1], base_pos[2] + 0.5]]))[0]
         size = block_pool.size(kind)
@@ -312,6 +321,25 @@ def handle_block_requests() -> None:
         # 寝かせるときは長辺を進む向きに対して横に、立てるときは面を Go2 に向ける
         yaw = heading if upright or kind == "cube" else heading + np.pi / 2
         block_pool.spawn(kind, position, yaw, upright)
+
+
+def spawn_pyramid(base_pos: np.ndarray, heading: float) -> None:
+    """10 cm 角のブロックを、面を Go2 に向けたピラミッドに積んだ状態で置く (落とさない)。"""
+    size = block_pool.size("cube")[0]
+    pitch = size * 1.01  # ぴったり並べると隣どうしがめり込んではじけるので、少しすき間をあける
+    forward = np.array([np.cos(heading), np.sin(heading)])
+    left = np.array([-forward[1], forward[0]])
+    center = base_pos[:2] + PYRAMID_AHEAD * forward
+    # 古いピラミッドのブロックを使い回すことがあるので、ブロックは無視して地面の高さを測る
+    ground_z = block_raycaster.cast_down(np.array([[center[0], center[1], base_pos[2] + 0.5]]), with_boxes=False)[0]
+    for level in range(PYRAMID_LEVELS):
+        n = PYRAMID_LEVELS - level
+        z = max(ground_z, -1.0) + size * (level + 0.5) + 0.002 * (level + 1)
+        for i in range(n):
+            for j in range(n):
+                u, v = (np.array([i, j]) - (n - 1) / 2) * pitch
+                xy = center + u * forward + v * left
+                block_pool.spawn("cube", np.array([xy[0], xy[1], z]), heading)
 
 
 def on_physics_step(step_size: float, context: object) -> None:
@@ -351,7 +379,7 @@ physics_callback_id = SimulationManager.register_callback(on_physics_step, Isaac
 
 print(f"go2_rc: policy '{args.policy}', sending /gait/force (FR FL RR RL) to {args.host}:{args.port}")
 print("go2_rc: arrows/WASD = move, N/M or Q/E = turn, R = reset, T = rebuild terrain scan, C = chase camera on/off")
-print("go2_rc: B / G = 10x10x20 cm block lying / standing, V = 10 cm cube, X = clear blocks")
+print("go2_rc: B / G = 10x10x20 cm block lying / standing, V = 10 cm cube, P = cube pyramid, X = clear blocks")
 
 timeline = omni.timeline.get_timeline_interface()
 timeline.play()
