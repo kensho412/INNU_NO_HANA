@@ -20,6 +20,8 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
     V               10 cm 角のブロックを Go2 の前に置く
     P               10 cm 角のブロックを 4 段のピラミッド (4×4, 3×3, 2×2, 1 の 30 個) に積んで Go2 の前に置く
     X               置いたブロックをすべて片付ける
+    1〜5            速さを 20 / 40 / 60 / 80 / 100 % にする (前後・横・旋回のすべて)
+    - / = (テンキーの - / +)   速さを 10 % ずつ下げる / 上げる (10〜100 %)
 
 障害物は /World/Terrain の下に、衝突判定 (Collision) 付きで置く (terrain.py を参照)。
 キーで置くブロックは物理演算つきで、蹴ると動き、積むこともできる (blocks.py を参照)。
@@ -59,6 +61,8 @@ parser.add_argument("--course", choices=["demo", "none"], default="demo", help="
 parser.add_argument("--usd", default=None, help="会場モデルなどの USD ファイル (/World/Terrain/Venue に置く)")
 parser.add_argument("--spawn-yaw", type=float, default=0.0,
                     help="Go2 の初期の向き [度] (+x から反時計回り。bundled では無視)")
+parser.add_argument("--speed", type=float, default=1.0,
+                    help="起動時の速さ (0.1〜1.0。1.0 で前後 1.0 m/s・横 0.6 m/s・旋回 1.0 rad/s)")
 parser.add_argument("--print-force", action="store_true", help="送信値を 0.5 秒ごとに表示する")
 parser.add_argument("--grid", action="store_true", help="8×8 の足場を置く (高さは Max から /grid/height で変える)")
 parser.add_argument("--grid-center", type=float, nargs=2, default=None, metavar=("X", "Y"),
@@ -122,7 +126,11 @@ SIM_STANDING_PER_FOOT_N = 147.3 / 4
 FORCE_GAIN = REAL_STANDING / SIM_STANDING_PER_FOOT_N
 
 # キー → [vx, vy, yaw_rate] (押している間だけ加算)。学習時の指令範囲は各 ±1.0
-VX, VY, YAW = 1.0, 0.6, 1.0  # m/s, m/s, rad/s
+VX, VY, YAW = 1.0, 0.6, 1.0  # m/s, m/s, rad/s (速さ 100 % のとき)
+# 速さ: キーで決めた指令にこの倍率を掛ける。学習時の範囲を超えないよう 1.0 まで
+SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.1, 1.0, 0.1
+SPEED_KEYS = {"KEY_1": 0.2, "KEY_2": 0.4, "KEY_3": 0.6, "KEY_4": 0.8, "KEY_5": 1.0}
+SPEED_STEP_KEYS = {"MINUS": -1, "NUMPAD_SUBTRACT": -1, "EQUAL": 1, "NUMPAD_ADD": 1}
 KEY_COMMANDS = {
     "UP": [VX, 0, 0], "W": [VX, 0, 0], "NUMPAD_8": [VX, 0, 0],
     "DOWN": [-VX, 0, 0], "S": [-VX, 0, 0], "NUMPAD_2": [-VX, 0, 0],
@@ -285,6 +293,18 @@ last_grid_step = np.zeros(grid.GRID_N * grid.GRID_N, dtype=np.int32)
 # ---------------------------------------------------------------------------------------------
 
 base_command = np.zeros(3, dtype=np.float32)
+speed_scale = float(np.clip(args.speed, SPEED_MIN, SPEED_MAX))
+
+
+def set_speed(value: float) -> None:
+    global speed_scale
+    speed_scale = float(np.clip(round(value, 2), SPEED_MIN, SPEED_MAX))
+    print(f"go2_rc: speed {speed_scale * 100:.0f} % (forward {VX * speed_scale:.2f} m/s, "
+          f"side {VY * speed_scale:.2f} m/s, turn {YAW * speed_scale:.2f} rad/s)", flush=True)
+
+
+def command() -> np.ndarray:
+    return base_command * speed_scale
 reset_requested = False
 terrain_rebuild_requested = False
 camera_toggle_requested = False
@@ -307,6 +327,10 @@ def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
             block_requests.append("pyramid")
         elif name == "X":
             block_requests.append(None)
+        elif name in SPEED_KEYS:
+            set_speed(SPEED_KEYS[name])
+        elif name in SPEED_STEP_KEYS:
+            set_speed(speed_scale + SPEED_STEP_KEYS[name] * SPEED_STEP)
     increment = KEY_COMMANDS.get(name)
     if increment is not None:
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -435,15 +459,15 @@ def on_physics_step(step_size: float, context: object) -> None:
             print(f"go2_rc: grid heights set (cm) {np.round(stepping_grid.heights * 100).astype(int).tolist()}", flush=True)
         if first_step or reset_requested:
             if controller is None:
-                go2.restart_from_default_state(base_command.tolist())
+                go2.restart_from_default_state(command().tolist())
             else:
                 reset_robot(go2.articulation)
                 controller.reset()
             first_step = reset_requested = False
         elif controller is None:
-            go2.step(step_size, base_command.tolist())
+            go2.step(step_size, command().tolist())
         else:
-            controller.step(base_command)
+            controller.step(command())
     except Exception as error:  # noqa: BLE001 - a physics callback must not raise
         policy_failed = True
         carb.log_error(f"go2_rc: policy failed, stopping: {error}")
@@ -469,6 +493,7 @@ physics_callback_id = SimulationManager.register_callback(on_physics_step, Isaac
 print(f"go2_rc: policy '{args.policy}', sending /gait/force (FR FL RR RL) to {args.host}:{args.port}")
 print("go2_rc: arrows/WASD = move, N/M or Q/E = turn, R = reset, T = rebuild terrain scan, C = chase camera on/off")
 print("go2_rc: B / G = 10x10x20 cm block lying / standing, V = 10 cm cube, P = cube pyramid, X = clear blocks")
+print(f"go2_rc: 1-5 = speed 20-100 %, - / = = slower / faster (now {speed_scale * 100:.0f} %)")
 
 # Max からの /grid/height (メインループで受け取り、次の物理ステップで反映する)
 listen_socket = None
@@ -530,7 +555,7 @@ while simulation_app.is_running():
     if args.print_force and now >= next_print:
         realtime = (physics_steps - steps_at_print) * PHYSICS_DT / (now - next_print + 0.5)
         print(
-            f"/gait/force {' '.join(map(str, last_sent))}   cmd {np.round(base_command, 2).tolist()}"
+            f"/gait/force {' '.join(map(str, last_sent))}   cmd {np.round(command(), 2).tolist()}"
             f"   realtime x{realtime:.2f}",
             flush=True,
         )
