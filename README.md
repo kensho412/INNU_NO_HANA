@@ -72,6 +72,7 @@ Go2 のモデルや床などの素材は、起動時に NVIDIA の配布サー�
 | R | 初期位置に戻す (転んだときも) |
 | T | 障害物を動かした・足したあとに、足元の高さ計測用の地形を作り直す |
 | C | Go2 の後ろを追従するカメラ / 自由に動かせる通常のカメラ の切り替え |
+| F | 足場を手前から少し (約 20°) 見下ろす固定カメラ / 元のカメラ の切り替え (`--grid` のとき。象の鼻テラスでは入口から見る) |
 | B | 10×10×20 cm のブロックを Go2 の前に寝かせて置く (進む向きに対して横向き) |
 | G | 10×10×20 cm のブロックを Go2 の前に立てて置く |
 | V | 10 cm 角のブロックを Go2 の前に置く |
@@ -122,7 +123,7 @@ python go2_rc.py [--host 127.0.0.1] [--port 9871] [--policy rough|flat|bundled]
                  [--course demo|none] [--usd 会場.usd] [--spawn-yaw 度]
                  [--print-force] [--physics-device cpu|cuda] [--no-chase-camera]
                  [--grid] [--grid-ahead 1.0] [--grid-center X Y] [--listen-port 9872]
-                 [--speed 1.0]
+                 [--speed 1.0] [--fixed-camera] [--record 記録.csv]
 ```
 
 | オプション | 意味 |
@@ -139,6 +140,8 @@ python go2_rc.py [--host 127.0.0.1] [--port 9871] [--policy rough|flat|bundled]
 | `--grid-ahead` | Go2 の初期位置から足場の手前の端までの距離 [m] (既定 1.0) |
 | `--grid-center` | 足場の中心 [m]。省略すると Go2 の初期位置の `--grid-ahead` 先から始まる |
 | `--listen-port` | `/grid/height` を受け取るポート (既定 9872) |
+| `--fixed-camera` | 起動時から足場を見る固定カメラにする (F キーで切り替え) |
+| `--record` | 足の荷重 [N]・送った /gait/force の値・/imu/rpy・胴体の位置を、時刻つきで 50 Hz の CSV に書き出す |
 | `--speed` | 起動時の速さ (0.1〜1.0、既定 1.0)。歩いている途中でも 1〜5 や - / = キーで変えられる |
 
 ## OSC `/gait/force`
@@ -150,6 +153,21 @@ python go2_rc.py [--host 127.0.0.1] [--port 9871] [--policy rough|flat|bundled]
 倍率は「静止時に体重 (147 N) が 4 本に均等にかかる」と仮定し、
 `実機の静止立ちの値 ÷ 36.8 N` で決めています (`go2_rc.py` の `REAL_STANDING`)。
 実機の値 `23 17 36 26` は `innu.maxpat` に残っていた値で、実機で測り直して差し替える予定です。
+
+## OSC `/imu/*` (胴体の姿勢・ジャイロ・加速度)
+
+`/gait/force` と同じ送信先に 50 Hz で送ります。値は小数 (float) で、名前と単位は実機の `LowState.imu_state` に合わせています。
+Max では `[route /gait/force /imu/rpy /imu/gyro /imu/accel]` などで分けられます。
+
+| アドレス | 中身 | 実機 |
+|---|---|---|
+| `/imu/rpy f f f` | 姿勢 roll pitch yaw [rad]。roll + = 右に傾く、pitch + = 頭が下がる、yaw + = 左を向く | `imu_state.rpy` |
+| `/imu/gyro f f f` | 胴体の x (前)・y (左)・z (上) 軸まわりの回転の速さ [rad/s] | `imu_state.gyroscope` |
+| `/imu/accel f f f` | 胴体の x・y・z 方向の加速度 [m/s²]。重力を含む (水平に止まっていると z ≒ +9.8) | `imu_state.accelerometer` |
+
+- yaw は起動時の向きが基準ではなく、シミュレータの +x 方向が 0 です (象の鼻テラスでは起動時に約 -2.76 rad)
+- 加速度は胴体の速度の差から求めているので、足が着くたびに大きく揺れます
+- シミュレータの不整地用ポリシーは、止まっていると頭を少し上げた姿勢 (pitch ≒ -0.18 rad) で立ちます
 
 ## 会場
 

@@ -13,6 +13,26 @@
         "boxes": [
             {
                 "box": {
+                    "id": "obj-3",
+                    "maxclass": "newobj",
+                    "numinlets": 1,
+                    "numoutlets": 0,
+                    "patching_rect": [ 419.0, 127.0, 165.0, 22.0 ],
+                    "text": "udpsend 100.66.185.27 3825"
+                }
+            },
+            {
+                "box": {
+                    "id": "obj-2",
+                    "maxclass": "newobj",
+                    "numinlets": 1,
+                    "numoutlets": 0,
+                    "patching_rect": [ 223.0, 127.0, 162.0, 22.0 ],
+                    "text": "udpsend 100.97.202.78 1111"
+                }
+            },
+            {
+                "box": {
                     "id": "obj-8",
                     "maxclass": "newobj",
                     "numinlets": 1,
@@ -45,7 +65,22 @@
         "lines": [
             {
                 "patchline": {
+                    "destination": [ "obj-2", 0 ],
+                    "order": 1,
+                    "source": [ "obj-1", 0 ]
+                }
+            },
+            {
+                "patchline": {
+                    "destination": [ "obj-3", 0 ],
+                    "order": 0,
+                    "source": [ "obj-1", 0 ]
+                }
+            },
+            {
+                "patchline": {
                     "destination": [ "obj-8", 0 ],
+                    "order": 2,
                     "source": [ "obj-1", 0 ]
                 }
             }

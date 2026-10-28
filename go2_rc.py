@@ -15,6 +15,7 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
     R               初期位置に戻す (転んだときも)
     T               障害物を動かした・足したあとに、高さ計測用の地形を作り直す
     C               Go2 の後ろを追従するカメラ / 自由に動かせる通常のカメラ を切り替える (起動時は追従)
+    F               足場を手前 (象の鼻テラスでは入口) から少し見下ろす固定カメラ / 元のカメラ を切り替える (--grid)
     B               10×10×20 cm のブロックを Go2 の前に寝かせて置く (進む向きに対して横向き)
     G               10×10×20 cm のブロックを Go2 の前に立てて置く
     V               10 cm 角のブロックを Go2 の前に置く
@@ -25,6 +26,15 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
 
 障害物は /World/Terrain の下に、衝突判定 (Collision) 付きで置く (terrain.py を参照)。
 キーで置くブロックは物理演算つきで、蹴ると動き、積むこともできる (blocks.py を参照)。
+
+胴体の IMU (/gait/force と同じ送信先へ 50 Hz。実機の LowState.imu_state と同じ値・単位):
+    /imu/rpy    f f f  姿勢 roll pitch yaw [rad] (roll + = 右に傾く、pitch + = 頭が下がる、yaw + = 左を向く)
+    /imu/gyro   f f f  胴体の x (前) y (左) z (上) 軸まわりの回転の速さ [rad/s]
+    /imu/accel  f f f  胴体の x y z 方向の加速度 [m/s²]。重力を含む (水平に止まっていると z ≒ +9.8)
+
+記録 (--record 記録.csv): 50 Hz で 1 行ずつ CSV に書く
+    time_s (シミュレーションの時刻 [s])、wall_time (PC の時計)、FR_N FL_N RR_N RL_N (足の荷重 [N])、
+    FR FL RR RL (/gait/force で送った値)、roll pitch yaw (/imu/rpy と同じ [rad])、x y z (胴体の位置 [m])
 
 8×8 の足場 (--grid、grid.py を参照):
     Max → シミュレータ  /grid/height  64 個の数 (整数でも小数でも)。マスごとの高さ [cm]、受け取ったときに一括で反映
@@ -44,6 +54,8 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
 """
 
 import argparse
+import csv
+import datetime
 import os
 import socket
 import struct
@@ -72,6 +84,9 @@ parser.add_argument("--grid-ahead", type=float, default=1.0,
 parser.add_argument("--listen-port", type=int, default=9872, help="Max から /grid/height を受け取るポート")
 parser.add_argument("--physics-device", choices=["cpu", "cuda"], default="cpu",
                     help="物理計算の場所。ロボット 1 台とブロック程度なら CPU のほうが速い")
+parser.add_argument("--fixed-camera", action="store_true", help="起動時から足場を見る固定カメラにする (F キーで切り替え可)")
+parser.add_argument("--record", default=None, metavar="CSV",
+                    help="足の荷重と /imu/rpy を時刻つきで CSV に書き出す (50 Hz)")
 parser.add_argument("--no-chase-camera", action="store_true", help="起動時は追従カメラを使わない (C キーで切り替え可)")
 args, _ = parser.parse_known_args()
 
@@ -103,7 +118,7 @@ from pxr import Gf, UsdGeom
 import blocks
 import grid
 import terrain
-from go2_policy import IsaacLabGo2Controller, TerrainRaycaster, configure_robot, reset_robot
+from go2_policy import IsaacLabGo2Controller, TerrainRaycaster, _rotation_matrix_wxyz, configure_robot, reset_robot
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -174,6 +189,14 @@ def send_gait_force(values: np.ndarray) -> None:
 
 def send_osc_ints(address: str, values: np.ndarray) -> None:
     packet = _osc_string(address) + _osc_string("," + "i" * len(values)) + struct.pack(f">{len(values)}i", *values)
+    try:
+        osc_socket.sendto(packet, osc_target)
+    except OSError as error:
+        carb.log_warn(f"OSC send failed: {error}")
+
+
+def send_osc_floats(address: str, values: np.ndarray) -> None:
+    packet = _osc_string(address) + _osc_string("," + "f" * len(values)) + struct.pack(f">{len(values)}f", *values)
     try:
         osc_socket.sendto(packet, osc_target)
     except OSError as error:
@@ -286,6 +309,48 @@ foot_sensors = [
 # 足場のどのマスを踏んでいるかを調べるための、足先の位置
 foot_links = RigidPrim([f"/World/Go2/{leg}_foot" for leg in LEGS]) if stepping_grid is not None else None
 GRID_SEND_EVERY = 4  # /grid/step と /grid/foot は物理 4 ステップごと (50 Hz) に送る
+IMU_SEND_EVERY = 4  # /imu/* も 50 Hz
+GRAVITY = np.array([0.0, 0.0, -9.81])
+imu_previous_velocity: np.ndarray | None = None  # 加速度を速度の差から求めるための、前回の胴体の速度 (ワールド座標)
+
+
+def send_imu() -> tuple[np.ndarray, np.ndarray]:
+    """胴体の姿勢・角速度・加速度を、実機の IMU (LowState.imu_state) と同じ形で送る。胴体の (位置, rpy) を返す。"""
+    global imu_previous_velocity
+    positions, orientations = go2.articulation.get_world_poses()
+    lin_vel, ang_vel = go2.articulation.get_velocities()
+    w, x, y, z = orientations.numpy().reshape(-1)
+    lin_vel = lin_vel.numpy().reshape(-1).astype(np.float64)
+    rot = _rotation_matrix_wxyz(np.array([w, x, y, z]))
+    rpy = [np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)),
+           np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0)),
+           np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))]
+    gyro = rot.T @ ang_vel.numpy().reshape(-1)
+    # 加速度計は「加速度 − 重力」を胴体の向きで測る (止まっていると上向きに +9.8)
+    world_accel = np.zeros(3) if imu_previous_velocity is None else (
+        (lin_vel - imu_previous_velocity) / (IMU_SEND_EVERY * PHYSICS_DT))
+    imu_previous_velocity = lin_vel
+    accel = rot.T @ (world_accel - GRAVITY)
+    send_osc_floats("/imu/rpy", np.array(rpy))
+    send_osc_floats("/imu/gyro", gyro)
+    send_osc_floats("/imu/accel", accel)
+    return positions.numpy().reshape(-1), np.array(rpy)
+
+
+record_file = None
+record_writer = None
+if args.record:
+    record_file = open(args.record, "w", newline="", encoding="utf-8")
+    record_writer = csv.writer(record_file)
+    record_writer.writerow(["time_s", "wall_time", *(f"{leg}_N" for leg in LEGS), *LEGS,
+                            "roll", "pitch", "yaw", "x", "y", "z"])
+    print(f"go2_rc: recording foot force and /imu/rpy to {os.path.abspath(args.record)}")
+
+
+def record_row(force_n: np.ndarray, base_position: np.ndarray, rpy: np.ndarray) -> None:
+    record_writer.writerow([f"{physics_steps * PHYSICS_DT:.3f}", datetime.datetime.now().isoformat(timespec="milliseconds"),
+                            *(f"{v:.2f}" for v in force_n), *last_sent.tolist(),
+                            *(f"{v:.4f}" for v in rpy), *(f"{v:.3f}" for v in base_position)])
 last_grid_step = np.zeros(grid.GRID_N * grid.GRID_N, dtype=np.int32)
 
 # ---------------------------------------------------------------------------------------------
@@ -308,11 +373,12 @@ def command() -> np.ndarray:
 reset_requested = False
 terrain_rebuild_requested = False
 camera_toggle_requested = False
+fixed_camera_toggle_requested = False
 block_requests: list[tuple[str, bool] | str | None] = []  # "pyramid" = ピラミッド、None = すべて片付ける
 
 
 def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
-    global reset_requested, terrain_rebuild_requested, camera_toggle_requested
+    global reset_requested, terrain_rebuild_requested, camera_toggle_requested, fixed_camera_toggle_requested
     name = event.input.name
     if event.type == carb.input.KeyboardEventType.KEY_PRESS:
         if name == "R":
@@ -321,6 +387,8 @@ def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
             terrain_rebuild_requested = True
         elif name == "C":
             camera_toggle_requested = True
+        elif name == "F":
+            fixed_camera_toggle_requested = True
         elif name in BLOCK_KEYS:
             block_requests.append(BLOCK_KEYS[name])
         elif name == "P":
@@ -353,6 +421,12 @@ CHASE_DISTANCE = 4.4  # Go2 の後ろ [m]
 CHASE_HEIGHT = 1.0  # Go2 の胴体からの高さ [m]
 CHASE_LOOK_AHEAD = 1.2  # Go2 の少し前を見る [m]
 CHASE_TIME_CONSTANT = 0.3  # 追従の遅れ [s] (小さいほどぴったりつく)
+# 足場を見る固定カメラ: 足場の中心から Go2 の初期の向きと逆へ FIXED_BACK、床から FIXED_HEIGHT の所に置き、
+# 足場の中心を見る。象の鼻テラス (--grid-ahead 7.6) では入口のガラス面の 0.5 m 手前 (スロープの上) になる
+FIXED_CAMERA_PATH = "/World/GridCam"
+FIXED_BACK = 3.1  # [m]
+FIXED_HEIGHT = 1.2  # [m] (足場の中心を約 20° 見下ろす)
+FIXED_FOCAL_LENGTH = 18.0  # [mm] (足場全体と Go2 が入る画角)
 
 
 class ChaseCamera:
@@ -390,6 +464,35 @@ class ChaseCamera:
 
 chase_camera = ChaseCamera()
 chase_camera.set_enabled(not args.no_chase_camera)
+
+fixed_camera_on = False
+chase_before_fixed = chase_camera.enabled  # 固定カメラから戻るときに、追従カメラに戻すか
+if stepping_grid is not None:
+    _camera = UsdGeom.Camera.Define(get_current_stage(), FIXED_CAMERA_PATH)
+    _camera.CreateFocalLengthAttr(FIXED_FOCAL_LENGTH)
+    _camera.CreateClippingRangeAttr().Set((0.05, 1000.0))
+    _center = np.array([*stepping_grid.center, stepping_grid.base_z])
+    _back = np.array([*stepping_grid.forward, 0.0])
+    _eye = _center - FIXED_BACK * _back + np.array([0.0, 0.0, FIXED_HEIGHT])
+    UsdGeom.Xformable(_camera.GetPrim()).AddTransformOp().Set(
+        Gf.Matrix4d().SetLookAt(Gf.Vec3d(*_eye), Gf.Vec3d(*_center), Gf.Vec3d(0, 0, 1)).GetInverse())
+
+
+def set_fixed_camera(on: bool) -> None:
+    """固定カメラにする / 切り替える前のカメラ (追従か通常) に戻す。"""
+    global fixed_camera_on, chase_before_fixed
+    if stepping_grid is None or on == fixed_camera_on:
+        return
+    fixed_camera_on = on
+    if on:
+        chase_before_fixed = chase_camera.enabled
+        chase_camera.set_enabled(False)
+        get_active_viewport().camera_path = FIXED_CAMERA_PATH
+    else:
+        chase_camera.set_enabled(chase_before_fixed)
+
+
+set_fixed_camera(args.fixed_camera)
 
 # ---------------------------------------------------------------------------------------------
 # 物理ステップごと: 歩行ポリシーを進め、足の力を送る
@@ -448,7 +551,7 @@ def spawn_pyramid(base_pos: np.ndarray, heading: float) -> None:
 
 
 def on_physics_step(step_size: float, context: object) -> None:
-    global first_step, reset_requested, policy_failed, last_sent, physics_steps, last_grid_step
+    global first_step, reset_requested, policy_failed, last_sent, physics_steps, last_grid_step, imu_previous_velocity
     physics_steps += 1
     if policy_failed:
         return
@@ -464,6 +567,7 @@ def on_physics_step(step_size: float, context: object) -> None:
                 reset_robot(go2.articulation)
                 controller.reset()
             first_step = reset_requested = False
+            imu_previous_velocity = None
         elif controller is None:
             go2.step(step_size, command().tolist())
         else:
@@ -476,6 +580,10 @@ def on_physics_step(step_size: float, context: object) -> None:
     force_n = np.array([s.get_sensor_reading().value for s in foot_sensors])
     last_sent = np.rint(np.maximum(force_n, 0.0) * FORCE_GAIN).astype(np.int32)
     send_gait_force(last_sent)
+    if physics_steps % IMU_SEND_EVERY == 0:
+        base_position, rpy = send_imu()
+        if record_writer is not None:
+            record_row(force_n, base_position, rpy)
     if stepping_grid is not None and physics_steps % GRID_SEND_EVERY == 0:
         positions, _ = foot_links.get_world_poses()
         foot_cells = stepping_grid.foot_cells(positions.numpy()[:, :2], force_n)
@@ -491,7 +599,8 @@ physics_callback_id = SimulationManager.register_callback(on_physics_step, Isaac
 # ---------------------------------------------------------------------------------------------
 
 print(f"go2_rc: policy '{args.policy}', sending /gait/force (FR FL RR RL) to {args.host}:{args.port}")
-print("go2_rc: arrows/WASD = move, N/M or Q/E = turn, R = reset, T = rebuild terrain scan, C = chase camera on/off")
+print("go2_rc: arrows/WASD = move, N/M or Q/E = turn, R = reset, T = rebuild terrain scan, C = chase camera on/off"
+      + (", F = fixed grid camera on/off" if stepping_grid is not None else ""))
 print("go2_rc: B / G = 10x10x20 cm block lying / standing, V = 10 cm cube, P = cube pyramid, X = clear blocks")
 print(f"go2_rc: 1-5 = speed 20-100 %, - / = = slower / faster (now {speed_scale * 100:.0f} %)")
 
@@ -539,7 +648,14 @@ while simulation_app.is_running():
         stepping_grid.show_stepped(last_grid_step)
     if camera_toggle_requested:
         camera_toggle_requested = False
-        chase_camera.set_enabled(not chase_camera.enabled)
+        if fixed_camera_on:  # 固定カメラのときに C を押したら追従カメラへ
+            fixed_camera_on = False
+            chase_camera.set_enabled(True)
+        else:
+            chase_camera.set_enabled(not chase_camera.enabled)
+    if fixed_camera_toggle_requested:
+        fixed_camera_toggle_requested = False
+        set_fixed_camera(not fixed_camera_on)
     if SimulationManager.is_simulating() and chase_camera.enabled:
         if controller is not None:
             chase_camera.update(controller.last_base_pose, FRAME_DT)
@@ -571,6 +687,8 @@ input_interface.unsubscribe_to_keyboard_events(keyboard, keyboard_sub)
 SimulationManager.deregister_callback(physics_callback_id)
 go2.close()
 osc_socket.close()
+if record_file is not None:
+    record_file.close()
 if listen_socket is not None:
     listen_socket.close()
 simulation_app.close()

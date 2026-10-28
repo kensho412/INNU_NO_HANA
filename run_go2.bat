@@ -6,7 +6,7 @@ rem   Go2 starts on the plaza 6 m in front of the main (north-east) entrance, fa
 rem   To use the demo obstacle course instead, make VENUE empty:  set VENUE=
 rem Drag and drop a .usd/.usdc/.usda file (e.g. exported from Blender) onto this file to load that instead.
 rem To send to the Mac, change HOST to the Mac's IP address.
-set HOST=100.127.189.90
+set HOST=127.0.0.1
 set VENUE=venues\zounohana_terrace.usdc
 set SPAWN_YAW=-158
 rem 8x8 stepping grid in front of Go2 (heights from Max: /grid/height to this PC, UDP 9872). To turn it off:  set GRID=
@@ -16,7 +16,7 @@ set GRID_IN_VENUE=--grid-ahead 7.6
 set OMNI_KIT_ACCEPT_EULA=YES
 cd /d "%~dp0"
 set PY="%~dp0env_isaacsim\Scripts\python.exe"
-set ARGS=--host %HOST% --port 9898 --print-force %GRID%
+set ARGS=--host %HOST% --port 9871 --print-force %GRID%
 if not "%~1"=="" (
     %PY% go2_rc.py %ARGS% --course none --usd "%~1"
 ) else if not "%VENUE%"=="" (
