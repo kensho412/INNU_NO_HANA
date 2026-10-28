@@ -16,6 +16,7 @@ innu.maxpat の [udpreceive 9871] → [route /gait/force] がそのまま受け�
     T               障害物を動かした・足したあとに、高さ計測用の地形を作り直す
     C               Go2 の後ろを追従するカメラ / 自由に動かせる通常のカメラ を切り替える (起動時は追従)
     F               足場を手前 (象の鼻テラスでは入口) から少し見下ろす固定カメラ / 元のカメラ を切り替える (--grid)
+    L               足場を右から左、左から右へと横切って周回する自動歩行 / 手動 を切り替える (--grid、track.py を参照)
     B               10×10×20 cm のブロックを Go2 の前に寝かせて置く (進む向きに対して横向き)
     G               10×10×20 cm のブロックを Go2 の前に立てて置く
     V               10 cm 角のブロックを Go2 の前に置く
@@ -85,6 +86,7 @@ parser.add_argument("--listen-port", type=int, default=9872, help="Max から /g
 parser.add_argument("--physics-device", choices=["cpu", "cuda"], default="cpu",
                     help="物理計算の場所。ロボット 1 台とブロック程度なら CPU のほうが速い")
 parser.add_argument("--fixed-camera", action="store_true", help="起動時から足場を見る固定カメラにする (F キーで切り替え可)")
+parser.add_argument("--auto-walk", action="store_true", help="起動時から足場を周回する自動歩行にする (L キーで切り替え可)")
 parser.add_argument("--record", default=None, metavar="CSV",
                     help="足の荷重と /imu/rpy を時刻つきで CSV に書き出す (50 Hz)")
 parser.add_argument("--no-chase-camera", action="store_true", help="起動時は追従カメラを使わない (C キーで切り替え可)")
@@ -118,6 +120,7 @@ from pxr import Gf, UsdGeom
 import blocks
 import grid
 import terrain
+import track
 from go2_policy import IsaacLabGo2Controller, TerrainRaycaster, _rotation_matrix_wxyz, configure_robot, reset_robot
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -276,6 +279,8 @@ if args.grid:
     del floor_raycaster
     stepping_grid = grid.SteppingGrid(tuple(grid_center), grid_yaw, base_z=floor_z)
     terrain_roots += (grid.FENCE_ROOT,)
+    walk_track = track.Track(stepping_grid.center, stepping_grid.forward, stepping_grid.left, stepping_grid.size)
+    walk_track.draw(get_current_stage(), floor_z)
     print(f"go2_rc: 8x8 grid at ({grid_center[0]:.2f}, {grid_center[1]:.2f}, floor {floor_z:.2f}), "
           f"listening for /grid/height on UDP {args.listen_port}")
 
@@ -368,7 +373,41 @@ def set_speed(value: float) -> None:
           f"side {VY * speed_scale:.2f} m/s, turn {YAW * speed_scale:.2f} rad/s)", flush=True)
 
 
+auto_walk_on = False
+
+
+def set_auto_walk(on: bool) -> None:
+    global auto_walk_on
+    if stepping_grid is None:
+        return
+    auto_walk_on = on
+    walk_track.restart()
+    print(f"go2_rc: auto walk {'on' if on else 'off'}", flush=True)
+
+
+def base_pose() -> tuple[np.ndarray, float, float]:
+    """胴体の位置 xyz、向き (yaw [rad])、上向きの z 成分 (1 = 水平、0 = 横倒し)。"""
+    if controller is not None and controller.last_base_pose is not None:
+        base_pos, (w, x, y, z) = controller.last_base_pose
+    else:
+        positions, orientations = go2.articulation.get_world_poses()
+        base_pos, (w, x, y, z) = positions.numpy().reshape(-1), orientations.numpy().reshape(-1)
+    return (base_pos, float(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))),
+            float(1 - 2 * (x * x + y * y)))
+
+
 def command() -> np.ndarray:
+    global reset_requested
+    if auto_walk_on:
+        base_pos, heading, up_z = base_pose()
+        t = physics_steps * PHYSICS_DT
+        action = walk_track.supervise(base_pos[:2], up_z, t, VX * speed_scale)
+        if action == "reset":
+            print("go2_rc: auto walk: stuck or fallen, back to the start", flush=True)
+            reset_requested = True
+        elif action == "back":
+            print("go2_rc: auto walk: stuck, backing up", flush=True)
+        return walk_track.command(base_pos[:2], heading, VX * speed_scale, YAW, t)
     return base_command * speed_scale
 reset_requested = False
 terrain_rebuild_requested = False
@@ -389,6 +428,8 @@ def on_keyboard_event(event: object, *args: object, **kwargs: object) -> bool:
             camera_toggle_requested = True
         elif name == "F":
             fixed_camera_toggle_requested = True
+        elif name == "L":
+            set_auto_walk(not auto_walk_on)
         elif name in BLOCK_KEYS:
             block_requests.append(BLOCK_KEYS[name])
         elif name == "P":
@@ -493,6 +534,8 @@ def set_fixed_camera(on: bool) -> None:
 
 
 set_fixed_camera(args.fixed_camera)
+if args.auto_walk:
+    set_auto_walk(True)
 
 # ---------------------------------------------------------------------------------------------
 # 物理ステップごと: 歩行ポリシーを進め、足の力を送る
@@ -511,12 +554,7 @@ def handle_block_requests() -> None:
         if request is None:
             block_pool.clear()
             continue
-        if controller is not None and controller.last_base_pose is not None:
-            base_pos, (w, x, y, z) = controller.last_base_pose
-        else:
-            positions, orientations = go2.articulation.get_world_poses()
-            base_pos, (w, x, y, z) = positions.numpy().reshape(-1), orientations.numpy().reshape(-1)
-        heading = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        base_pos, heading, _ = base_pose()
         if request == "pyramid":
             spawn_pyramid(base_pos, heading)
             continue
@@ -567,6 +605,8 @@ def on_physics_step(step_size: float, context: object) -> None:
                 reset_robot(go2.articulation)
                 controller.reset()
             first_step = reset_requested = False
+            if stepping_grid is not None:
+                walk_track.restart()
             imu_previous_velocity = None
         elif controller is None:
             go2.step(step_size, command().tolist())
@@ -600,7 +640,7 @@ physics_callback_id = SimulationManager.register_callback(on_physics_step, Isaac
 
 print(f"go2_rc: policy '{args.policy}', sending /gait/force (FR FL RR RL) to {args.host}:{args.port}")
 print("go2_rc: arrows/WASD = move, N/M or Q/E = turn, R = reset, T = rebuild terrain scan, C = chase camera on/off"
-      + (", F = fixed grid camera on/off" if stepping_grid is not None else ""))
+      + (", F = fixed grid camera on/off, L = auto walk around the grid on/off" if stepping_grid is not None else ""))
 print("go2_rc: B / G = 10x10x20 cm block lying / standing, V = 10 cm cube, P = cube pyramid, X = clear blocks")
 print(f"go2_rc: 1-5 = speed 20-100 %, - / = = slower / faster (now {speed_scale * 100:.0f} %)")
 
